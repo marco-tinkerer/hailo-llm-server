@@ -1,0 +1,24 @@
+[Unit]
+Description=Hailo NPU LLM Server (OpenAI-compatible)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=marcomark
+WorkingDirectory=/home/marcomark/Documents/code-projects/hailo-llm-server/src/npu_server
+ExecStart=/home/marcomark/Documents/code-projects/hailo-llm-server/src/npu_server/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# Allow access to Hailo PCIe device
+SupplementaryGroups=video render
+
+# Forward stdout/stderr to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hailo-llm-server
+
+[Install]
+WantedBy=multi-user.target

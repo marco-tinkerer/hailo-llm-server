@@ -7,12 +7,12 @@ class Settings(BaseSettings):
     model_config = {"env_prefix": "NPU_", "env_file": ".env", "env_file_encoding": "utf-8"}
 
     model_path: Path = Field(
-        default=Path("/home/marcomark/hailo-models/Qwen2-1.5B-Instruct-Function-Calling-v1.hef"),
+        default=Path("/home/marcomark/hailo-models/Qwen2.5-1.5B-Instruct.hef"),
         description="Path to .hef model file",
     )
     lora_name: str = Field(
-        default="huggingface_lora_adapter",
-        description="LoRA adapter name; empty string disables LoRA",
+        default="",
+        description="LoRA adapter name; empty string disables LoRA (required for function-calling HEF)",
     )
 
     max_generated_tokens: int = Field(default=512, ge=1, le=2048)

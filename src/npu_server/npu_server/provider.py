@@ -5,6 +5,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
+from pathlib import Path
+
 from hailo_platform.genai import LLM, VDevice  # type: ignore[import]
 from hailo_platform.pyhailort.pyhailort import HailoRTException  # type: ignore[import]
 
@@ -12,7 +14,19 @@ from .config import Settings
 
 logger = logging.getLogger(__name__)
 
-STOP_TOKENS = frozenset(["<|im_end|>", "<|endoftext|>"])
+DEFAULT_STOP_TOKENS = frozenset(
+    [
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|eot_id|>",
+        "<|end_of_text|>",
+        "<|eom_id|>",
+        "<｜begin▁of▁sentence｜>",
+        "<｜end▁of▁sentence｜>",
+        "<｜User｜>",
+        "<｜Assistant｜>",
+    ]
+)
 
 
 class HailoProviderError(RuntimeError):
@@ -33,13 +47,45 @@ class HailoProvider:
         self._settings = settings
         self._vdevice: VDevice | None = None
         self._llm: LLM | None = None
+        self._stop_tokens: set[str] = set(DEFAULT_STOP_TOKENS)
+
+    @property
+    def model_path(self) -> Path:
+        return self._settings.model_path
+
+    @property
+    def model_name(self) -> str:
+        return self._settings.model_path.name
+
+    @property
+    def lora_name(self) -> str:
+        return self._settings.lora_name
 
     def initialize(self) -> None:
-        logger.info("Initializing Hailo NPU device")
+        logger.info("Initializing Hailo NPU device with model: %s", self._settings.model_path)
         self._vdevice = VDevice()
         kwargs: dict = {"lora_name": self._settings.lora_name} if self._settings.lora_name else {}
         self._llm = LLM(self._vdevice, str(self._settings.model_path), **kwargs)
-        logger.info("NPU device ready, max context: %d tokens", self._llm.max_context_capacity())
+        self._stop_tokens = set(DEFAULT_STOP_TOKENS)
+        try:
+            model_stops = self._llm.get_stop_tokens()
+            if model_stops:
+                self._stop_tokens.update(model_stops)
+        except Exception:
+            logger.debug("Could not query model stop tokens", exc_info=True)
+        logger.info(
+            "NPU device ready (model=%s, max_context=%d, stop_tokens=%s)",
+            self.model_name,
+            self._llm.max_context_capacity(),
+            sorted(self._stop_tokens),
+        )
+
+    def load_model(self, model_path: Path, lora_name: str = "") -> None:
+        logger.info("Switching NPU model to %s (lora=%r)", model_path, lora_name)
+        self.release()
+        self._settings.model_path = model_path
+        self._settings.lora_name = lora_name
+        self.initialize()
 
     def reinitialize(self) -> None:
         logger.warning("Re-initializing NPU device after fault")
@@ -69,6 +115,12 @@ class HailoProvider:
     def prompt_template(self) -> str:
         return self._require_llm().prompt_template()
 
+    def count_tokens(self, text: str) -> int:
+        try:
+            return len(self._require_llm().tokenize(text))
+        except Exception:
+            return max(1, len(text) // 4)
+
     def max_context_capacity(self) -> int:
         return self._require_llm().max_context_capacity()
 
@@ -97,12 +149,34 @@ class HailoProvider:
         self,
         prompt: str,
         max_generated_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        frequency_penalty: float | None = None,
+        seed: int | None = None,
     ) -> AsyncIterator[tuple[AsyncIterator[str], GenerateMetrics]]:
         """Async streaming generator. Yields (token_stream, metrics).
         Metrics are populated after the stream is exhausted."""
         llm = self._require_llm()
         max_tokens = max_generated_tokens or self._settings.max_generated_tokens
         timeout = self._settings.inference_timeout_s
+
+        eff_temp = temperature if temperature is not None else self._settings.temperature
+        eff_freq = frequency_penalty if frequency_penalty is not None else self._settings.frequency_penalty
+        if eff_temp > 0.0:
+            do_sample = True
+            gen_temp: float | None = eff_temp
+            gen_top_p = top_p if top_p is not None else self._settings.top_p
+            gen_top_k = top_k if top_k is not None else self._settings.top_k
+            gen_seed = seed
+        else:
+            do_sample = self._settings.do_sample
+            gen_temp = None
+            gen_top_p = None
+            gen_top_k = None
+            gen_seed = None
+
+        stop_tokens = self._stop_tokens
         loop = asyncio.get_running_loop()
         token_queue: asyncio.Queue[str | None] = asyncio.Queue()
         error_holder: list[BaseException] = []
@@ -114,11 +188,16 @@ class HailoProvider:
             try:
                 with llm.generate(
                     prompt,
+                    temperature=gen_temp,
+                    top_p=gen_top_p,
+                    top_k=gen_top_k,
+                    frequency_penalty=eff_freq,
                     max_generated_tokens=max_tokens,
-                    do_sample=self._settings.do_sample,
+                    do_sample=do_sample,
+                    seed=gen_seed,
                 ) as gen:
                     for token in gen:
-                        if token in STOP_TOKENS:
+                        if token in stop_tokens:
                             continue
                         if first_token:
                             metrics.ttft_s = time.monotonic() - t_start
@@ -157,9 +236,26 @@ class HailoProvider:
 
         yield _stream(), metrics
 
-    async def generate_all(self, prompt: str, max_generated_tokens: int | None = None) -> tuple[str, GenerateMetrics]:
+    async def generate_all(
+        self,
+        prompt: str,
+        max_generated_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        frequency_penalty: float | None = None,
+        seed: int | None = None,
+    ) -> tuple[str, GenerateMetrics]:
         parts: list[str] = []
-        async with self.generate(prompt, max_generated_tokens) as (stream, metrics):
+        async with self.generate(
+            prompt,
+            max_generated_tokens=max_generated_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
+            seed=seed,
+        ) as (stream, metrics):
             async for token in stream:
                 parts.append(token)
         return "".join(parts), metrics
